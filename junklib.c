@@ -2394,7 +2394,7 @@ junk_id3v2_convert_24_to_23 (DB_id3v2_tag_t *tag24, DB_id3v2_tag_t *tag23) {
         uint8_t flags[2];
         // 1st byte (status flags) is the same, but shifted by 1 bit to the left
         flags[0] = f24->flags[0] << 1;
-        
+
         // 2nd byte (format flags) is quite different
         // 2.4 format is %0h00kmnp (6:grouping, 3:compression, 2:encryption, 1:unsync, 0:datalen)
         // 2.3 format is %ijk00000 (7:compression, 6:encryption, 5:grouping)
@@ -2586,7 +2586,7 @@ junk_id3v2_convert_23_to_24 (DB_id3v2_tag_t *tag23, DB_id3v2_tag_t *tag24) {
         // 1st byte (status flags) is the same, but shifted by 1 bit to the
         // right
         flags[0] = f23->flags[0] >> 1;
-        
+
         // 2nd byte (format flags) is quite different
         // 2.4 format is %0h00kmnp (6:grouping, 3:compression, 2:encryption, 1:unsync, 0:datalen)
         // 2.3 format is %ijk00000 (7:compression, 6:encryption, 5:grouping)
@@ -2776,7 +2776,7 @@ junk_id3v2_convert_22_to_24 (DB_id3v2_tag_t *tag22, DB_id3v2_tag_t *tag24) {
         // 1st byte (status flags) is the same, but shifted by 1 bit to the
         // right
         flags[0] = f22->flags[0] >> 1;
-        
+
         // 2nd byte (format flags) is quite different
         // 2.4 format is %0h00kmnp (grouping, compression, encryption, unsync)
         // 2.3 format is %ijk00000 (compression, encryption, grouping)
@@ -3006,7 +3006,7 @@ junk_id3v2_convert_apev2_to_24 (DB_apev2_tag_t *ape, DB_id3v2_tag_t *tag24) {
         "Comment", "EAN/UPC", "ISBN", "Catalog", "LC", "Publicationright", "Record Location", "Related", "Abstract", "Bibliography", NULL
     };
 
-    // FIXME: additional frames: File->WOAF 
+    // FIXME: additional frames: File->WOAF
     // converted to COMM: Comment, EAN/UPC, ISBN, Catalog, LC, Publicationright, Record Location, Related, Abstract, Bibliography
     // "Debut album" is discarded
     // "Index" is discarded
@@ -3662,6 +3662,72 @@ static int junk_id3v2_load_rva2 (int version_major, playItem_t *it, uint8_t *rea
     return 0;
 }
 
+// Convert popm rating to stars
+// As per Windows Media Player mapping
+// https://github.com/Alexey-Yakovenko/deadbeef/issues/1143
+int junk_id3v2_convert_popm_rating_to_stars(int rating) {
+  if (rating >= 1 && rating <= 31) {
+    return 1;
+  } else if (rating >= 32 && rating <= 95) {
+    return 2;
+  } else if (rating >= 96 && rating <= 159) {
+    return 3;
+  } else if (rating >= 160 && rating <= 221) {
+    return 4;
+  } else if (rating >= 222 && rating <= 255) {
+    return 5;
+  }
+
+  // out of range - let's return 0 (unrated)
+  else return 0;
+}
+
+
+// Load POPM frame from id3v2 tag.
+// This loads 3 metadata fields:
+// popm_owner - the email / string of the owner of this popm frame
+// popm_rating_raw - raw integer representing value (0..255)
+// popm_rating_raw_original - raw integer representing value (0..255)
+// popm_rating - POPM rating value converted to star rating as per Windows Media Player
+//
+// popm_rating_raw_original and popm_rating_raw are later compared when saving updated id3v2 tags
+// so that we would not overwrite the value if it was not changed.
+// TODO this popm_rating_raw_original is probably not required
+int
+junk_id3v2_load_popm (int version_major, playItem_t *it, uint8_t *readptr, int synched_size) {
+    char *owner = readptr;
+    while (*readptr && synched_size > 0) {
+
+        readptr++;
+        synched_size--;
+    }
+
+    trace("synched_size remaining %d\n", synched_size);
+
+    readptr++;
+    synched_size--;
+
+    uint8_t rating;
+    memcpy (&rating, readptr, 1);
+
+    trace("Owner: %s\n", owner);
+    trace("rating %d\n", rating);
+
+    pl_replace_meta (it, "popm_owner", owner);
+    // storing both pop_rating_raw and popm_rating_raw_original
+    // so that later we would not be overwritting values if noone changes the value
+
+
+    pl_set_meta_int(it, "popm_rating_raw", rating);
+    pl_set_meta_int(it, "popm_rating_raw_original", rating);
+
+    int stars = junk_id3v2_convert_popm_rating_to_stars(rating);
+    pl_set_meta_int(it, "popm_rating", stars);
+
+    return 0;
+}
+
+
 int
 junk_id3v2_load_ufid (int version_major, playItem_t *it, uint8_t *readptr, int synched_size) {
     char *owner = readptr;
@@ -3714,6 +3780,69 @@ junk_id3v2_remove_ufid_frames (DB_id3v2_tag_t *tag, const char *frame_id, const 
     }
     return 0;
 }
+
+
+// Remove popm frames from ID3v2.
+// If owner is set to NULL this will remove all popm frames
+// If owner is set to something, then it will remove the frame that matches this owner.
+// This is important because the specification allows to have more than one popm frame.
+int
+junk_id3v2_remove_popm_frame (DB_id3v2_tag_t *tag, const char *frame_id, const char *owner) {
+    DB_id3v2_frame_t *prev = NULL;
+    for (DB_id3v2_frame_t *f = tag->frames; f; ) {
+        DB_id3v2_frame_t *next = f->next;
+        if (!strcmp (f->id, frame_id) && ( (owner == NULL) || (f->size >= strlen(owner) && !strcmp (f->data, owner)))) {
+            if (prev) {
+                prev->next = f->next;
+            }
+            else {
+                tag->frames = f->next;
+            }
+            free (f);
+        }
+        else {
+            prev = f;
+        }
+        f = next;
+    }
+    return 0;
+}
+
+// Add popm frame:
+// this frame consists of:
+// 1. owner email (a character string)
+// 2. rating 0..255
+// 3. count - we are not counting number of plays and as such always setting it to 0
+DB_id3v2_frame_t *
+junk_id3v2_add_popm_frame (DB_id3v2_tag_t *tag, const char *owner, const char rating) {
+    trace("add POPM frame");
+    int ownerlen = strlen (owner);
+    int len = ownerlen + 3;
+    const char playcount = 0;
+
+    // make a frame
+    trace ("calculated POPM frame size = %d\n", len);
+    DB_id3v2_frame_t *f = malloc (len + sizeof (DB_id3v2_frame_t));
+    memset (f, 0, sizeof (DB_id3v2_frame_t));
+    strcpy (f->id, "POPM");
+    f->size = len;
+    memcpy (f->data, owner, ownerlen+1);
+    memcpy (f->data+ownerlen+1, &rating, 1);
+    memcpy (f->data+ownerlen+2, &playcount, 1);
+
+    // append to tag
+    DB_id3v2_frame_t *tail;
+    for (tail = tag->frames; tail && tail->next; tail = tail->next);
+    if (tail) {
+        tail->next = f;
+    }
+    else {
+        tag->frames = f;
+    }
+
+    return f;
+}
+
 
 DB_id3v2_frame_t *
 junk_id3v2_add_ufid_frame (DB_id3v2_tag_t *tag, const char *owner, const char *id, int id_len) {
@@ -3912,7 +4041,7 @@ junk_id3v2_read_full (playItem_t *it, DB_id3v2_tag_t *tag_store, DB_FILE *fp) {
     uint8_t *readptr = tag;
     int crcpresent = 0;
     trace ("version: 2.%d.%d, unsync: %d, extheader: %d, experimental: %d\n", version_major, version_minor, unsync, extheader, expindicator);
-    
+
     if (extheader) {
         uint32_t sz = (readptr[3] << 0) | (readptr[2] << 7) | (readptr[1] << 14) | (readptr[0] << 21);
         if (size < sz) {
@@ -4160,6 +4289,11 @@ junk_id3v2_read_full (playItem_t *it, DB_id3v2_tag_t *tag_store, DB_FILE *fp) {
                         continue;
                     }
                     junk_id3v2_load_ufid (version_major, it, readptr, synched_size);
+                }
+                // load ratings from POPM frame
+                else if (it && !strcmp (frameid, "POPM")) {
+                    trace("Got POPM field\n");
+                    junk_id3v2_load_popm (version_major, it, readptr, synched_size);
                 }
                 else if (it && !strcmp (frameid, "TXXX")) {
                     if (synched_size < 2) {
@@ -4513,12 +4647,43 @@ junk_rewrite_tags (playItem_t *it, uint32_t junk_flags, int id3v2_version, const
             if (val && *val) {
                 junk_id3v2_add_comment_frame (&id3v2, "eng", "", val);
             }
+
             // UFID
             junk_id3v2_remove_ufid_frames (&id3v2, "UFID", "http://musicbrainz.org");
             val = pl_find_meta (it, "musicbrainz_trackid");
             if (val && *val) {
                 junk_id3v2_add_ufid_frame (&id3v2, "http://musicbrainz.org", val, strlen (val));
             }
+
+            // POPM
+            // There may be more than one POPM tag. We will only overwrite the one that has the
+            // same email / user associated with it.
+            val = pl_find_meta (it, "popm_owner");
+            const char *val1 = pl_find_meta (it, "popm_rating_raw");
+            const char *rating_original = pl_find_meta (it, "popm_rating_raw_original");
+
+            trace("popm rating val1 %d\n", val1);
+            trace("popm rating orig %d\n", rating_original);
+
+            // do not remove or rewrite the popm frames if there were no changes to rating
+            if((val1 && *val1 && rating_original && *rating_original && strcmp(val1, rating_original))
+            || (val1 == NULL && rating_original == NULL)
+            || (val1 != NULL && rating_original == NULL)
+            || (val1 == NULL && rating_original != NULL)
+            ) {
+
+              trace("invoking popm processing");
+              if (val && *val && val1 && *val1) {
+                junk_id3v2_remove_popm_frame (&id3v2, "POPM", val);
+              } else {
+                junk_id3v2_remove_popm_frame (&id3v2, "POPM", NULL);
+              }
+              if (val && *val && val1 && *val1) {
+                printf("converted rating is %d\n", atoi(val1));
+                junk_id3v2_add_popm_frame (&id3v2, val, atoi(val1));
+              }
+            }
+
         }
         pl_unlock ();
 
@@ -4554,6 +4719,12 @@ junk_rewrite_tags (playItem_t *it, uint32_t junk_flags, int id3v2_version, const
                     && strcasecmp (meta->key, "numtracks")
                     && strcasecmp (meta->key, "disc")
                     && strcasecmp (meta->key, "numdiscs")
+                    // popm_owner and popm_rating_raw are used to store the popm frame values.
+                    // We know how to handle them as a separate frame
+                    && strcasecmp (meta->key, "popm_owner")
+                    && strcasecmp (meta->key, "popm_rating_raw")
+                    && strcasecmp (meta->key, "popm_rating")
+                    && strcasecmp (meta->key, "popm_rating_raw_original")
                ) {
                 // add as txxx
                 int out_size;
